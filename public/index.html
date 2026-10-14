@@ -18,6 +18,7 @@
   <nav class="tabs" role="tablist">
     <button id="tabSend" class="tab active" role="tab">Send</button>
     <button id="tabReceive" class="tab" role="tab">Receive</button>
+    <button id="tabText" class="tab" role="tab">Text</button>
   </nav>
 
   <!-- ============ SENDER ============ -->
@@ -57,6 +58,7 @@
         <div class="code-wrap">
           <div class="muted small">Or enter this code on the other device</div>
           <div id="shareCode" class="code">––––––</div>
+          <div id="codeExpiry" class="muted small"></div>
           <div class="row">
             <button id="btnCopyCode" class="btn ghost">Copy code</button>
             <button id="btnCopyLink" class="btn ghost">Copy link</button>
@@ -86,6 +88,18 @@
       <button id="btnJoin" class="btn primary">Connect</button>
       <button id="btnLeave" class="btn ghost" hidden>Disconnect</button>
     </div>
+    <div class="row">
+      <button id="btnScan" class="btn">Scan QR with camera</button>
+      <label class="btn ghost" for="qrFile" style="cursor:pointer">Upload QR image</label>
+      <input id="qrFile" type="file" accept="image/*" hidden />
+    </div>
+    <div id="scanWrap" hidden>
+      <div id="qrReader"></div>
+      <div class="row">
+        <button id="btnStopScan" class="btn ghost">Stop camera</button>
+      </div>
+      <div class="muted small">Camera needs HTTPS (or localhost). Permission keta Allow kudunga; QR camera munnadi kaatunga.</div>
+    </div>
     <div id="receiverStatus" class="status">Not connected.</div>
 
     <div id="recvProgressWrap" class="progress-wrap" hidden>
@@ -94,6 +108,20 @@
       <div id="recvStats" class="muted small"></div>
       <a id="downloadLink" class="btn primary" hidden>Download file</a>
     </div>
+  </section>
+
+  <!-- ============ TEXT ============ -->
+  <section id="paneText" class="card" hidden>
+    <h2>Send text</h2>
+    <p class="muted">Links, passwords, notes — instantly to the connected device. First connect via the Send / Receive tab.</p>
+    <div id="textStatus" class="status">Not connected.</div>
+    <div class="row">
+      <textarea id="textInput" class="text-input" rows="3" maxlength="20000" placeholder="Type text or paste a link…"></textarea>
+    </div>
+    <div class="row">
+      <button id="btnTextSend" class="btn primary">Send text</button>
+    </div>
+    <div id="msgList" class="msg-list" hidden></div>
   </section>
 
   <section class="card log-card">
@@ -113,6 +141,7 @@
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

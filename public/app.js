@@ -40,6 +40,45 @@ function fmtBytes(n) {
 function fmtSpeed(bps) {
   return `${fmtBytes(bps)}/s`;
 }
+function fmtETA(elapsedSec, done, total) {
+  if (done >= total) return "0s";
+  if (!done || !Number.isFinite(elapsedSec) || elapsedSec <= 0) return "—";
+  const s = Math.round((elapsedSec / done) * (total - done));
+  if (!Number.isFinite(s)) return "—";
+  return s < 60 ? `${s}s left` : `${Math.floor(s / 60)}m ${s % 60}s left`;
+}
+// Screen wake-lock: stops phones from sleeping mid-transfer. Best-effort.
+let wakeLock = null;
+async function lockScreen() {
+  try {
+    if ("wakeLock" in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+      log("Screen sleep locked during transfer.");
+    }
+  } catch {}
+}
+async function releaseScreen() {
+  try { wakeLock && await wakeLock.release(); } catch {}
+  wakeLock = null;
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && (S.started || (R.meta && !R.done))) lockScreen();
+});
+// Completion feedback: subtle beep + title flash (tab visible from far).
+function notifyDone(name) {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = 880; g.gain.value = 0.08;
+    o.start(); o.stop(ctx.currentTime + 0.25);
+  } catch {}
+  const orig = document.title;
+  document.title = "✓ Done — " + name;
+  setTimeout(() => { document.title = orig; }, 4000);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- compatibility ----------
@@ -55,17 +94,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 })();
 
 // ---------- tabs ----------
-const tabSend = $("tabSend"), tabReceive = $("tabReceive");
-const paneSend = $("paneSend"), paneReceive = $("paneReceive");
+const tabSend = $("tabSend"), tabReceive = $("tabReceive"), tabText = $("tabText");
+const paneSend = $("paneSend"), paneReceive = $("paneReceive"), paneText = $("paneText");
 function showTab(which) {
-  const send = which === "send";
-  tabSend.classList.toggle("active", send);
-  tabReceive.classList.toggle("active", !send);
-  paneSend.hidden = !send;
-  paneReceive.hidden = send;
+  tabSend.classList.toggle("active", which === "send");
+  tabReceive.classList.toggle("active", which === "receive");
+  tabText.classList.toggle("active", which === "text");
+  paneSend.hidden = which !== "send";
+  paneReceive.hidden = which !== "receive";
+  paneText.hidden = which !== "text";
 }
 tabSend.onclick = () => showTab("send");
 tabReceive.onclick = () => showTab("receive");
+tabText.onclick = () => showTab("text");
 
 // ---------- signaling socket (shared) ----------
 let ws = null;
@@ -116,6 +157,7 @@ const S = {
 const R = {
   code: null,
   pc: null,
+  dc: null,
   pendingIce: [],
   fileId: null,
   meta: null,
@@ -181,6 +223,18 @@ $("btnCreate").onclick = async () => {
 
 function showShare(code) {
   S.code = code;
+  clearInterval(S.expiryTimer);
+  const expiresAt = Date.now() + 10 * 60 * 1000; // matches server CODE_TTL_MS
+  const tick = () => {
+    const left = Math.max(0, expiresAt - Date.now());
+    const mm = Math.floor(left / 60000), ss = Math.floor((left % 60000) / 1000);
+    $("codeExpiry").textContent = left > 0
+      ? `Code expires in ${mm}:${String(ss).padStart(2, "0")} — receiver should join soon`
+      : "Code expired. Click “Get QR & code” again.";
+    if (!left) { clearInterval(S.expiryTimer); S.code = null; $("btnCreate").disabled = false; }
+  };
+  tick();
+  S.expiryTimer = setInterval(tick, 1000);
   $("shareBox").hidden = false;
   $("shareCode").textContent = code;
   setStatus($("senderStatus"), "Waiting for receiver to enter the code…");
@@ -222,6 +276,7 @@ $("btnCancelSend").onclick = () => {
   try { S.dc && S.dc.send(JSON.stringify({ kind: "cancel" })); } catch {}
   if (S.useRelay && S.code) sendSignal({ type: "relay", code: S.code, payload: { kind: "cancel", fileId: S.fileId } });
   closeSenderPeer(true);
+  releaseScreen();
   setStatus($("senderStatus"), "Transfer cancelled.");
   $("btnRetrySend").hidden = false;
 };
@@ -293,6 +348,8 @@ async function startTransfer(forceRelay) {
   S.useRelay = forceRelay;
   S.started = true;
   S.startTime = Date.now();
+  S.chunkSize = CHUNK_SIZE;
+  lockScreen();
   S.totalChunks = Math.max(1, Math.ceil(S.file.size / CHUNK_SIZE));
   $("sendProgressWrap").hidden = false;
   $("btnRetrySend").hidden = true;
@@ -355,6 +412,8 @@ async function pumpP2P() {
   log(`P2P transfer complete: ${S.totalChunks} chunks.`);
   S.started = false;
   clearTimeout(S.p2pTimer);
+  notifyDone(file.name);
+  releaseScreen();
 }
 
 function updateSendProgress() {
@@ -363,8 +422,8 @@ function updateSendProgress() {
   $("sendBar").style.width = pct + "%";
   $("sendPct").textContent = pct + "%";
   const elapsed = Math.max(0.1, (Date.now() - S.startTime) / 1000);
-  const bytes = Math.min(S.file ? S.file.size : 0, done * CHUNK_SIZE);
-  $("sendStats").textContent = `${fmtBytes(bytes)} of ${fmtBytes(S.file.size)} · ${fmtSpeed(bytes / elapsed)} · chunk ${done}/${total}`;
+  const bytes = Math.min(S.file ? S.file.size : 0, done * (S.chunkSize || CHUNK_SIZE));
+  $("sendStats").textContent = `${fmtBytes(bytes)} of ${fmtBytes(S.file.size)} · ${fmtSpeed(bytes / elapsed)} · ETA ${fmtETA(elapsed, done, total)} · chunk ${done}/${total}`;
 }
 
 // ---------- sender: relay fallback (server-forwarded chunks) ----------
@@ -379,6 +438,7 @@ async function relaySend() {
   const { file, fileId, code } = S;
   const total = Math.max(1, Math.ceil(file.size / RELAY_CHUNK_SIZE));
   S.totalChunks = total;
+  S.chunkSize = RELAY_CHUNK_SIZE;
   sendSignal({ type: "relay", code, payload: {
     kind: "relay-meta", fileId, name: file.name, size: file.size,
     mime: file.type || "application/octet-stream", totalChunks: total,
@@ -400,6 +460,8 @@ async function relaySend() {
   setStatus($("senderStatus"), `Relayed ${file.name} via server.`, "ok");
   log("Relay transfer complete.");
   S.started = false;
+  notifyDone(file.name);
+  releaseScreen();
 }
 
 function closeSenderPeer(logIt) {
@@ -456,6 +518,7 @@ function makeReceiverPC() {
   };
   pc.ondatachannel = (e) => {
     const dc = e.channel;
+    R.dc = dc;
     dc.binaryType = "arraybuffer";
     log("Data channel received.");
     dc.onmessage = onP2PMessage(dc);
@@ -481,10 +544,13 @@ function onP2PMessage(dc) {
         $("recvProgressWrap").hidden = false;
         $("recvLabel").textContent = `Receiving ${m.name}…`;
         setStatus($("receiverStatus"), `Receiving ${m.name} (${fmtBytes(m.size)}) directly…`, "ok");
+        lockScreen();
         log(`Receiving ${m.name} — ${m.totalChunks} chunks${R.received ? ` (resuming at ${R.received})` : ""}.`);
         // Tell sender where to start (resume support).
         dc.send(JSON.stringify({ kind: "resume", fileId: m.fileId, received: R.received }));
         updateRecvProgress();
+      } else if (m.kind === "text") {
+        addMessage(m.text || "", false);
       } else if (m.kind === "done") {
         finishReceive();
       } else if (m.kind === "cancel") {
@@ -512,7 +578,7 @@ function updateRecvProgress() {
   const elapsed = Math.max(0.1, (Date.now() - R.startTime) / 1000);
   const bytes = R.meta ? Math.min(R.meta.size, R.received * (R.meta.chunkSize || CHUNK_SIZE)) : 0;
   const totalB = R.meta ? R.meta.size : 0;
-  $("recvStats").textContent = `${fmtBytes(bytes)} of ${fmtBytes(totalB)} · ${fmtSpeed(bytes / elapsed)} · chunk ${R.received}/${total}`;
+  $("recvStats").textContent = `${fmtBytes(bytes)} of ${fmtBytes(totalB)} · ${fmtSpeed(bytes / elapsed)} · ETA ${fmtETA(elapsed, R.received, total)} · chunk ${R.received}/${total}`;
 }
 
 function finishReceive() {
@@ -529,12 +595,16 @@ function finishReceive() {
   updateRecvProgress();
   setStatus($("receiverStatus"), `Received ${R.meta.name} (${fmtBytes(blob.size)}). Tap Download to save it.`, "ok");
   log(`Transfer complete: ${R.meta.name}.`);
+  notifyDone(R.meta.name);
+  releaseScreen();
   try { a.click(); } catch {} // best-effort auto-download; button remains regardless
 }
 
 function closeReceiverPeer(logIt = true) {
   try { R.pc && R.pc.close(); } catch {}
   R.pc = null;
+  R.dc = null;
+  releaseScreen();
   if (logIt) log("Receiver peer connection closed.");
 }
 
@@ -552,11 +622,13 @@ async function onRelayPayload(p) {
     R.fileId = p.fileId;
     R.relayMode = true;
     if (!sameFile) { R.meta = p; R.totalChunks = p.totalChunks; R.chunks = new Array(p.totalChunks); R.received = 0; R.startTime = Date.now(); }
+    p.chunkSize = RELAY_CHUNK_SIZE; // correct progress math for 32 KB relay chunks
     R.done = false;
     $("recvProgressWrap").hidden = false;
     $("recvLabel").textContent = `Receiving ${p.name} (relay)…`;
     setStatus($("receiverStatus"), `Receiving ${p.name} via server relay…`, "ok");
     log(`Relay receive: ${p.name}, ${p.totalChunks} chunks.`);
+    lockScreen();
     // Tell sender our offset so relay can resume.
     if (R.code) sendSignal({ type: "relay", code: R.code, payload: { kind: "relay-ack", fileId: p.fileId, received: R.received } });
     updateRecvProgress();
@@ -577,6 +649,8 @@ async function onRelayPayload(p) {
       S.sentChunks = p.received;
       log(`Relay resuming from chunk ${p.received}.`);
     }
+  } else if (p.kind === "relay-text") {
+    addMessage(p.text || "", false);
   } else if (p.kind === "cancel") {
     setStatus($("receiverStatus"), "Sender cancelled the transfer.", "err");
   }
@@ -599,10 +673,12 @@ async function onSignalMessage(ev) {
     $("btnLeave").hidden = false;
     makeReceiverPC(); // ready before offer arrives; queued ICE handled below
     log(`Joined room ${m.code}.`);
+    setStatus($("textStatus"), `Connected to ${m.code} — you can send text here.`, "ok");
     return;
   }
   if (m.type === "peer-joined") {
     setStatus($("senderStatus"), "Receiver connected! Starting transfer…", "ok");
+    setStatus($("textStatus"), "Receiver connected — you can send text here.", "ok");
     log("Receiver joined — auto-starting transfer.");
     $("btnSendStart").disabled = false;
     if (S.file && !S.started) startTransfer(false);
@@ -651,6 +727,8 @@ async function onSignalMessage(ev) {
   }
   if (m.type === "peer-left") {
     log("The other device disconnected.");
+    setStatus($("textStatus"), "The other device left.", "err");
+    releaseScreen();
     if (paneSend.hidden === false) setStatus($("senderStatus"), "The other device left. The code stays valid for a short while.", "err");
     else setStatus($("receiverStatus"), "The other device left.", "err");
     return;
@@ -677,6 +755,149 @@ async function onSignalMessage(ev) {
   }
   if (m.type === "left") { log("Left room."); return; }
 }
+
+// ---------- QR camera scanner (receiver) ----------
+let qrScanner = null;
+let scanning = false;
+
+function extractCode(text) {
+  if (!text) return null;
+  try {
+    // Full QR link like https://host/?code=482913
+    const u = new URL(text, location.href);
+    const c = (u.searchParams.get("code") || "").trim();
+    if (/^\d{6}$/.test(c)) return c;
+  } catch {}
+  const m = String(text).match(/(\d{6})/);
+  return m ? m[1] : null;
+}
+
+function handleScannedText(text) {
+  const code = extractCode(text);
+  if (!code) {
+    log("QR scanned but no 6-digit code found in it.");
+    return;
+  }
+  log(`QR scanned: code ${code}.`);
+  stopScan().finally(() => {
+    showTab("receive");
+    $("codeInput").value = code;
+    $("btnJoin").click();
+  });
+}
+
+async function startScan() {
+  if (scanning) return;
+  if (typeof Html5Qrcode === "undefined") {
+    setStatus($("receiverStatus"), "Scanner library not loaded (offline?). Type the code manually or use Upload QR image.", "err");
+    log("Html5Qrcode CDN missing — manual code entry fallback.");
+    return;
+  }
+  scanning = true;
+  $("scanWrap").hidden = false;
+  $("btnScan").disabled = true;
+  setStatus($("receiverStatus"), "Camera starting… point at the sender's QR.");
+  try {
+    qrScanner = new Html5Qrcode("qrReader");
+    await qrScanner.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: { width: 250, height: 250 } },
+      (decoded) => handleScannedText(decoded),
+      () => {}
+    );
+    log("Camera scanner started.");
+  } catch (err) {
+    scanning = false;
+    $("btnScan").disabled = false;
+    const msg = /secure|https|permission|denied/i.test(err.message || "")
+      ? "Camera blocked: use HTTPS (or localhost) and Allow camera permission."
+      : "Camera start failed: " + (err.message || err);
+    setStatus($("receiverStatus"), msg + " You can type the code manually.", "err");
+    log(msg);
+  }
+}
+
+async function stopScan() {
+  try {
+    if (qrScanner) {
+      try { await qrScanner.stop(); } catch {}
+      try { qrScanner.clear(); } catch {}
+    }
+  } finally {
+    qrScanner = null;
+    scanning = false;
+    $("scanWrap").hidden = true;
+    $("btnScan").disabled = false;
+  }
+}
+
+$("btnScan").onclick = startScan;
+$("btnStopScan").onclick = async () => {
+  await stopScan();
+  setStatus($("receiverStatus"), "Camera stopped. Type the code or scan again.");
+};
+
+// Fallback: scan a QR image file (desktop without camera).
+$("qrFile").addEventListener("change", async () => {
+  const f = $("qrFile").files && $("qrFile").files[0];
+  if (!f) return;
+  if (typeof Html5Qrcode === "undefined") {
+    setStatus($("receiverStatus"), "Scanner library not loaded. Type the code manually.", "err");
+    return;
+  }
+  try {
+    const tmp = new Html5Qrcode("qrReader");
+    const result = await tmp.scanFile(f, true);
+    handleScannedText(result);
+    try { tmp.clear(); } catch {}
+  } catch {
+    setStatus($("receiverStatus"), "Could not read QR from that image. Try a clearer photo or type the code.", "err");
+  }
+  $("qrFile").value = "";
+});
+
+// ---------- instant text share (same connection, either direction) ----------
+function activeCode() { return S.code || R.code; }
+function p2pOpen() {
+  if (S.dc && S.dc.readyState === "open") return S.dc;
+  if (R.dc && R.dc.readyState === "open") return R.dc;
+  return null;
+}
+function addMessage(text, mine) {
+  if (!text) return;
+  const wrap = $("msgList");
+  wrap.hidden = false;
+  const div = document.createElement("div");
+  div.className = "msg" + (mine ? " mine" : "");
+  const span = document.createElement("span");
+  span.textContent = (mine ? "You: " : "Peer: ") + text;
+  const btn = document.createElement("button");
+  btn.className = "btn ghost small-btn";
+  btn.textContent = "Copy";
+  btn.onclick = async () => {
+    try { await navigator.clipboard.writeText(text); btn.textContent = "Copied"; }
+    catch { btn.textContent = "Copy failed"; }
+  };
+  div.append(span, btn);
+  wrap.prepend(div);
+  if (!mine) notifyDone("text message");
+}
+$("btnTextSend").onclick = async () => {
+  const text = $("textInput").value.trim();
+  if (!text) { setStatus($("textStatus"), "Type something first.", "err"); return; }
+  if (text.length > 20000) { setStatus($("textStatus"), "Text too long (20,000 chars max).", "err"); return; }
+  try {
+    const dc = p2pOpen();
+    if (dc) dc.send(JSON.stringify({ kind: "text", text }));
+    else if (activeCode()) await sendSignal({ type: "relay", code: activeCode(), payload: { kind: "relay-text", text } });
+    else { setStatus($("textStatus"), "Connect first: sender — Get QR & code; receiver — enter code.", "err"); return; }
+    addMessage(text, true);
+    $("textInput").value = "";
+    setStatus($("textStatus"), "Sent.", "ok");
+  } catch (err) {
+    setStatus($("textStatus"), "Send failed: " + err.message, "err");
+  }
+};
 
 // ---------- deep link: ?code=123456 auto-joins as receiver ----------
 (function autoJoin() {

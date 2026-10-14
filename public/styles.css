@@ -44,7 +44,7 @@ body {
 .card h3 { margin: 0 0 8px; font-size: 15px; }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
-.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .tab {
   padding: 12px;
   border-radius: 12px;
@@ -122,3 +122,30 @@ body {
 .log li { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
 .warn { background: var(--warn-bg); color: var(--warn-ink); padding: 12px; border-radius: 10px; font-size: 14px; }
 a.btn { text-decoration: none; display: inline-block; text-align: center; }
+#scanWrap { margin-top: 12px; display: grid; gap: 8px; }
+#qrReader { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #000; max-width: 340px; }
+#qrReader video { width: 100%; display: block; }
+.text-input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  font-size: 15px;
+  font-family: inherit;
+  resize: vertical;
+}
+.msg-list { display: grid; gap: 8px; margin-top: 12px; }
+.msg {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fafc;
+  word-break: break-word;
+  font-size: 14px;
+}
+.msg.mine { background: #eff6ff; border-color: #bfdbfe; }
+.small-btn { padding: 4px 10px; font-size: 12px; flex-shrink: 0; }

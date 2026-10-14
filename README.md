@@ -35,6 +35,15 @@ on a LAN, or a public URL via ngrok / Tailscale / deployment).
 3. Transfer starts automatically; both sides see progress, speed, and status.
    The receiver gets a **Download** button (auto-click attempted).
 
+## Extra features
+
+- **Text tab:** send links / passwords / notes instantly to the connected
+  device (same P2P channel, relay fallback if P2P isn't up yet).
+- **Receive → Scan QR with camera** (+ Upload QR image fallback for desktops).
+- **ETA** on both progress bars; **code expiry countdown** (10:00 → 0:00).
+- **Screen wake-lock** during transfers so phones don't sleep mid-file;
+  **beep + title flash** when a transfer or message completes.
+
 ## How it works
 
 ```
