@@ -1,7 +1,7 @@
 # P2P Share — direct browser-to-browser file transfer
 
-Upload on one device → get a **QR code + 6-digit code** → scan / enter it on a second
-device → files move **directly between browsers**. No accounts, no file storage.
+Upload on one device → get a **QR code + 6-digit code** → up to **5 devices**
+scan / enter it → files go **directly between browsers**. No accounts, no file storage.
 
 ## Stack (and why)
 
@@ -30,8 +30,9 @@ on a LAN, or a public URL via ngrok / Tailscale / deployment).
 
 1. **Sender (device A):** open app → *Send* → drop a file → **Get QR & code** →
    show the QR / read out the 6 digits. Keep the tab open.
-2. **Receiver (device B):** scan the QR (opens `?code=XXXXXX` and auto-connects)
-   or open the app → *Receive* → type the code → **Connect**.
+2. **Receivers:** up to 5 devices can use the same code — scan the QR
+   (opens `?code=XXXXXX` and auto-connects) or open the app → *Receive* →
+   type the code → **Connect**.
 3. Transfer starts automatically; both sides see progress, speed, and status.
    The receiver gets a **Download** button (auto-click attempted).
 
@@ -43,6 +44,18 @@ on a LAN, or a public URL via ngrok / Tailscale / deployment).
 - **ETA** on both progress bars; **code expiry countdown** (10:00 → 0:00).
 - **Screen wake-lock** during transfers so phones don't sleep mid-file;
   **beep + title flash** when a transfer or message completes.
+- **Auto-relay:** if direct P2P fails or takes >12s (typical for PC-WiFi ↔
+  phone-data), the sender switches to server relay by itself — no button press.
+- **Cancel auto-clears** both sides (progress reset, partial chunks dropped);
+  sender can press Start again for a fresh send. Receiver has its own
+  **Cancel** button — pressing it stops only that receiver; others continue.
+- **Nicknames:** editable name on top, saved in browser, shown to peers
+  (receiver list, statuses, history). Changes propagate live.
+- **History:** sent + received files of this session with Download-again links.
+- **1 sender → 5 receivers:** same code for all; sender shows each receiver
+  with live %. 6th device gets "Room full". Each receiver has its own
+  connection with independent speed control, so a slow phone never slows a
+  fast PC — everyone gets their link's full speed.
 
 ## How it works
 

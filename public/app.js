@@ -12,10 +12,16 @@ const MAX_BUFFERED = 4 * 1024 * 1024;  // DataChannel backpressure threshold
 const P2P_TIMEOUT_MS = 12000;          // wait this long before suggesting relay
 
 const ICE_SERVERS = [
+  // STUN servers
   { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:global.stun.twilio.com:3478" },
-  // To guarantee cross-network transfers in production, add a TURN server here:
-  // { urls: "turn:your-turn-host:3478", username: "user", credential: "pass" }
+  { urls: "stun:stun1.l.google.com:3478" },
+  
+  // ExpressTURN free server (1000 GB/month free)
+  {
+    urls: "turn:free.expressturn.com:3478",
+    username: "000000002107350926",
+    credential: "tOBQTcRCtCQaOz6Qhmf4yIxII+M="
+  }
 ];
 
 // ---------- tiny dom helpers ----------
@@ -108,6 +114,48 @@ tabSend.onclick = () => showTab("send");
 tabReceive.onclick = () => showTab("receive");
 tabText.onclick = () => showTab("text");
 
+// ---------- nickname (editable, shown to the peer, saved locally) ----------
+function myNick() { return ($("nickInput").value || "").trim().slice(0, 24) || "Peer"; }
+let nickTimer = null;
+function sendNickUpdate() {
+  const nick = myNick();
+  if (S.code) sendSignal({ type: "nick", code: S.code, nick });
+  else if (R.code) sendSignal({ type: "nick", code: R.code, nick });
+}
+$("nickInput").value = localStorage.getItem("p2p-nick") || ("Device-" + Math.floor(1000 + Math.random() * 9000));
+$("nickInput").addEventListener("input", () => {
+  localStorage.setItem("p2p-nick", $("nickInput").value);
+  $("nickSaved").textContent = "saved";
+  clearTimeout(nickTimer);
+  nickTimer = setTimeout(sendNickUpdate, 600);
+});
+
+// ---------- history (this device, this session) ----------
+const historyItems = [];
+function addHistory(dir, name, size, url, peer) {
+  historyItems.unshift({ dir, name, size, url, peer: peer || "", time: new Date().toLocaleTimeString() });
+  renderHistory();
+}
+function renderHistory() {
+  const ul = $("historyList");
+  ul.innerHTML = "";
+  if (!historyItems.length) { ul.innerHTML = "<li>No transfers yet.</li>"; return; }
+  for (const h of historyItems) {
+    const li = document.createElement("li");
+    li.textContent = `${h.time} — ${h.dir === "sent" ? "↑ sent" : "↓ received"} ${h.name} (${fmtBytes(h.size)})${h.peer ? " ↔ " + h.peer : ""}`;
+    if (h.url) {
+      const a = document.createElement("a");
+      a.href = h.url;
+      a.download = h.name;
+      a.textContent = " Download again";
+      a.style.marginLeft = "6px";
+      li.appendChild(a);
+    }
+    ul.appendChild(li);
+  }
+}
+renderHistory();
+
 // ---------- signaling socket (shared) ----------
 let ws = null;
 let wsReady = null;
@@ -135,27 +183,23 @@ async function sendSignal(obj) {
   ws.send(JSON.stringify(obj));
 }
 
-// ---------- sender state ----------
+// ---------- sender state (1 sender → up to 5 receivers) ----------
+const MAX_PEERS = 5;
 const S = {
   file: null,
   fileId: null,
   code: null,
-  pc: null,
-  dc: null,
+  peers: new Map(), // peerId -> {id, nick, pc, dc, state, sentChunks, totalChunks, startTime, p2pTimer, pendingIce, useRelay, done, left, pumping}
   started: false,
   cancelled: false,
-  useRelay: false,
-  sentChunks: 0,
-  totalChunks: 0,
   startTime: 0,
-  p2pTimer: null,
-  pendingIce: [],
-  receiverAcked: 0,
 };
 
 // ---------- receiver state ----------
 const R = {
   code: null,
+  peerId: null,
+  senderNick: "",
   pc: null,
   dc: null,
   pendingIce: [],
@@ -184,7 +228,7 @@ fileInput.addEventListener("change", () => { if (fileInput.files[0]) pickFile(fi
 function pickFile(f) {
   S.file = f;
   S.fileId = `${f.name}-${f.size}-${f.lastModified}`;
-  S.started = false; S.cancelled = false; S.sentChunks = 0; S.useRelay = false;
+  S.started = false; S.cancelled = false;
   $("fileRow").hidden = false;
   $("fileName").textContent = f.name;
   $("fileSize").textContent = `${fmtBytes(f.size)} · ${f.type || "unknown type"}`;
@@ -192,7 +236,9 @@ function pickFile(f) {
   $("sendProgressWrap").hidden = true;
   $("btnRetrySend").hidden = true;
   $("btnRelay").hidden = true;
-  closeSenderPeer(false);
+  closeAllPeers(false);
+  for (const peer of S.peers.values()) { peer.done = false; peer.useRelay = false; peer.sentChunks = 0; peer.totalChunks = 0; peer.left = false; peer.state = "joined"; }
+  renderPeerList();
   if (f.size > 2 * 1024 * 1024 * 1024) {
     log("Warning: file exceeds 2 GB — transfer works but the receiver needs enough RAM to reassemble it.");
   }
@@ -212,7 +258,7 @@ $("btnCreate").onclick = async () => {
       $("btnCreate").disabled = false;
       return;
     }
-    sendSignal({ type: "create" });
+    sendSignal({ type: "create", nick: myNick() });
     setStatus($("senderStatus"), "Generating code…");
     log("Requesting connection code…");
   } catch (err) {
@@ -235,6 +281,9 @@ function showShare(code) {
   };
   tick();
   S.expiryTimer = setInterval(tick, 1000);
+  S.peers.clear();
+  renderPeerList();
+  updatePeerCount();
   $("shareBox").hidden = false;
   $("shareCode").textContent = code;
   setStatus($("senderStatus"), "Waiting for receiver to enter the code…");
@@ -266,164 +315,316 @@ $("btnCopyLink").onclick = async () => {
   catch { prompt("Copy this link:", link); }
 };
 
-$("btnSendStart").onclick = () => startTransfer(false);
+$("btnSendStart").onclick = () => startTransfer(false, false);
 $("btnRelay").onclick = () => {
-  log("Switching to server relay (slower, works on any network).");
-  startTransfer(true);
+  log("Switching all receivers to server relay (slower, works on any network).");
+  startTransfer(true, false);
 };
-$("btnCancelSend").onclick = () => {
+function senderCancelledByPeer() {
+  // Local Cancel pressed: stop everything and clear.
   S.cancelled = true;
-  try { S.dc && S.dc.send(JSON.stringify({ kind: "cancel" })); } catch {}
-  if (S.useRelay && S.code) sendSignal({ type: "relay", code: S.code, payload: { kind: "cancel", fileId: S.fileId } });
-  closeSenderPeer(true);
+  S.started = false;
+  closeAllPeers(false);
   releaseScreen();
-  setStatus($("senderStatus"), "Transfer cancelled.");
-  $("btnRetrySend").hidden = false;
+  for (const peer of S.peers.values()) { peer.sentChunks = 0; peer.totalChunks = 0; peer.done = false; peer.useRelay = false; peer.state = "joined"; }
+  $("sendBar").style.width = "0%";
+  $("sendPct").textContent = "0%";
+  $("sendStats").textContent = "";
+  $("sendProgressWrap").hidden = true;
+  $("btnRetrySend").hidden = true;
+  $("btnRelay").hidden = true;
+  $("btnSendStart").disabled = ![...S.peers.values()].some((p) => !p.left);
+  renderPeerList();
+  log("Transfer cleared.");
+}
+$("btnCancelSend").onclick = () => {
+  for (const peer of S.peers.values()) {
+    try { peer.dc && peer.dc.readyState === "open" && peer.dc.send(JSON.stringify({ kind: "cancel" })); } catch {}
+  }
+  if (S.code) sendSignal({ type: "relay", code: S.code, payload: { kind: "cancel", fileId: S.fileId } });
+  senderCancelledByPeer();
+  setStatus($("senderStatus"), "Cancelled — cleared. Press Start transfer for a fresh send.");
 };
 $("btnRetrySend").onclick = () => {
   $("btnRetrySend").hidden = true;
-  startTransfer(S.useRelay);
+  startTransfer(false, false);
 };
 
-// ---------- sender: WebRTC ----------
-function makeSenderPC() {
-  closeSenderPeer(false);
+// ---------- sender: one WebRTC connection per receiver ----------
+// Each receiver gets its own PeerConnection + DataChannel with independent
+// backpressure, so a slow phone never throttles a fast PC — every receiver
+// gets the full speed its own link allows (only the sender's total uplink
+// is shared, which no app can avoid).
+function addPeer(id, nick) {
+  let peer = S.peers.get(id);
+  if (!peer) {
+    peer = { id, nick: nick || "Receiver", pc: null, dc: null, state: "joined", sentChunks: 0, totalChunks: 0, startTime: 0, p2pTimer: null, pendingIce: [], useRelay: false, done: false, left: false, pumping: false };
+    S.peers.set(id, peer);
+  } else {
+    peer.nick = nick || peer.nick;
+    peer.left = false;
+  }
+  renderPeerList();
+  updatePeerCount();
+  return peer;
+}
+
+function updatePeerCount() {
+  const n = [...S.peers.values()].filter((p) => !p.left).length;
+  $("peerCount").textContent = n ? `${n} receiver(s) connected (max ${MAX_PEERS}).` : `No receivers yet (max ${MAX_PEERS}).`;
+}
+
+function peerLabel(peer) {
+  if (peer.left) return "left";
+  if (peer.done) return peer.useRelay ? "done (relay)" : "done (P2P)";
+  if (peer.useRelay) return "relaying…";
+  if (peer.state === "sending") return "sending…";
+  if (peer.state === "connected") return "connected";
+  return "connecting…";
+}
+
+function renderPeerList() {
+  const box = $("peerList");
+  if (!box) return;
+  box.innerHTML = "";
+  for (const peer of S.peers.values()) {
+    const div = document.createElement("div");
+    div.className = "peer" + (peer.done ? " peer-done" : "");
+    const top = document.createElement("div");
+    top.className = "peer-top";
+    const nm = document.createElement("span");
+    nm.textContent = peer.nick;
+    const st = document.createElement("span");
+    st.id = "peer-st-" + peer.id;
+    st.textContent = peerLabel(peer);
+    top.append(nm, st);
+    const bar = document.createElement("div");
+    bar.className = "progress";
+    const fill = document.createElement("div");
+    fill.className = "bar";
+    fill.id = "peer-bar-" + peer.id;
+    fill.style.width = Math.round(peerFrac(peer) * 100) + "%";
+    bar.appendChild(fill);
+    div.append(top, bar);
+    box.appendChild(div);
+  }
+}
+
+function peerFrac(p) {
+  const t = p.totalChunks || 1;
+  return Math.min(p.sentChunks, t) / t;
+}
+
+function updatePeerRow(peer) {
+  const st = $("peer-st-" + peer.id), bar = $("peer-bar-" + peer.id);
+  const pct = Math.round(peerFrac(peer) * 100) + "%";
+  if (st) st.textContent = peerLabel(peer) + (peer.done || peer.left ? "" : ` ${pct}`);
+  if (bar) bar.style.width = pct;
+}
+
+function makePeerPC(peer) {
+  closePeer(peer, false);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  S.pc = pc;
-  S.pendingIce = [];
+  peer.pc = pc;
+  peer.pendingIce = [];
+  peer.state = "connecting";
 
   pc.onicecandidate = (e) => {
-    if (e.candidate && S.code) sendSignal({ type: "signal", code: S.code, payload: { kind: "ice", candidate: e.candidate } });
+    if (e.candidate && S.code) sendSignal({ type: "signal", code: S.code, target: peer.id, payload: { kind: "ice", candidate: e.candidate } });
   };
   pc.onconnectionstatechange = () => {
     const st = pc.connectionState;
-    log(`Sender connection: ${st}`);
+    log(`Sender→${peer.nick}: ${st}`);
     if (st === "connected") {
-      clearTimeout(S.p2pTimer);
-      $("btnRelay").hidden = true;
-      setStatus($("senderStatus"), "Connected directly (P2P). Sending…", "ok");
-    } else if (st === "failed" || st === "disconnected") {
-      if (S.started && !S.useRelay) {
-        setStatus($("senderStatus"), "Direct connection failed (often strict NAT/firewall). Use relay instead.", "err");
+      clearTimeout(peer.p2pTimer);
+      peer.state = "connected";
+      updatePeerRow(peer);
+      if (S.peers.size === 1) setStatus($("senderStatus"), `Connected to ${peer.nick} directly (P2P). Sending…`, "ok");
+    } else if (st === "failed") {
+      if (S.started && !S.cancelled && !peer.useRelay && !peer.done && !peer.left) {
+        log(`Direct P2P to ${peer.nick} failed — auto-switching only that receiver to relay.`);
+        startRelayPeer(peer);
+      }
+    } else if (st === "disconnected") {
+      if (S.started && !peer.useRelay && !peer.done && !peer.left) {
+        updatePeerRow(peer);
         $("btnRelay").hidden = false;
-        $("btnRetrySend").hidden = false;
       }
     }
   };
 
   const dc = pc.createDataChannel("file", { ordered: true });
-  S.dc = dc;
+  peer.dc = dc;
   dc.binaryType = "arraybuffer";
   dc.bufferedAmountLowThreshold = 1024 * 1024;
   dc.onopen = () => {
-    log("Data channel open — sending file.");
-    pumpP2P();
+    log(`Data channel open to ${peer.nick} — sending.`);
+    if (S.started && !S.cancelled && !peer.done && !peer.left && !peer.useRelay) pumpPeerP2P(peer);
   };
   dc.onclose = () => {
-    if (S.started && !S.cancelled && S.sentChunks < S.totalChunks) {
-      setStatus($("senderStatus"), "Connection interrupted. Press Retry to resume.", "err");
+    if (S.started && !S.cancelled && !peer.useRelay && !peer.done && !peer.left && peer.sentChunks < peer.totalChunks) {
+      peer.state = "connecting";
+      updatePeerRow(peer);
+      setStatus($("senderStatus"), `${peer.nick}: interrupted. Press Retry to resume.`, "err");
       $("btnRetrySend").hidden = false;
-      log(`Interrupted at chunk ${S.sentChunks}/${S.totalChunks}. Retry resumes from receiver's progress.`);
+      log(`Interrupted to ${peer.nick} at ${peer.sentChunks}/${peer.totalChunks}.`);
     }
   };
   dc.onmessage = (e) => {
     if (typeof e.data !== "string") return;
     try {
       const m = JSON.parse(e.data);
-      if (m.kind === "ack") { S.receiverAcked = m.received; }
+      if (m.kind === "cancel-request") { stopPeer(peer, "cancelled"); setStatus($("senderStatus"), `${peer.nick} cancelled. Others continue.`, "err"); return; }
       if (m.kind === "resume") {
         // Receiver tells us how many chunks it already has.
-        const have = Math.min(m.received || 0, S.totalChunks);
-        if (have > S.sentChunks) { S.sentChunks = have; log(`Resuming from chunk ${have}/${S.totalChunks}.`); }
+        const have = Math.min(m.received || 0, peer.totalChunks);
+        if (have > peer.sentChunks) { peer.sentChunks = have; log(`Resuming ${peer.nick} from chunk ${have}/${peer.totalChunks}.`); }
       }
     } catch {}
   };
+
+  clearTimeout(peer.p2pTimer);
+  peer.p2pTimer = setTimeout(() => {
+    if (S.started && !S.cancelled && !peer.useRelay && !peer.done && !peer.left && peer.sentChunks === 0 && peer.pc && peer.pc.connectionState !== "connected") {
+      log(`P2P to ${peer.nick} taking >12s — auto-switching only that receiver to relay.`);
+      startRelayPeer(peer);
+    }
+  }, P2P_TIMEOUT_MS);
+  renderPeerList();
   return pc;
 }
 
-async function startTransfer(forceRelay) {
+function ensurePeerConnection(peer) {
+  if (peer.dc && peer.dc.readyState === "open") {
+    if (S.started && !S.cancelled && !peer.done && !peer.left && !peer.useRelay) pumpPeerP2P(peer);
+    return;
+  };
+  if (peer.pc && peer.pc.signalingState !== "stable") return; // handshake in flight
+  makePeerPC(peer);
+  peer.pc.createOffer()
+    .then((o) => peer.pc.setLocalDescription(o))
+    .then(() => sendSignal({ type: "signal", code: S.code, target: peer.id, payload: { kind: "offer", sdp: peer.pc.localDescription } }))
+    .then(() => log(`Offer sent to ${peer.nick}.`))
+    .catch((err) => setStatus($("senderStatus"), "Could not start WebRTC: " + err.message, "err"));
+}
+
+function closePeer(peer, logIt) {
+  if (!peer) return;
+  clearTimeout(peer.p2pTimer);
+  try { peer.dc && peer.dc.close(); } catch {}
+  try { peer.pc && peer.pc.close(); } catch {}
+  peer.pc = null; peer.dc = null; peer.pumping = false;
+  if (logIt) log(`Connection to ${peer.nick} closed.`);
+}
+
+function closeAllPeers(logIt) {
+  for (const peer of S.peers.values()) closePeer(peer, false);
+  if (logIt) log("All sender connections closed.");
+}
+
+// Stop one receiver without touching the others.
+function stopPeer(peer, reason) {
+  if (!peer || peer.left) return;
+  if (reason === "left") peer.left = true;
+  else { peer.sentChunks = 0; peer.done = false; peer.state = "joined"; }
+  closePeer(peer, false);
+  updatePeerRow(peer);
+  renderPeerList();
+  updatePeerCount();
+  log(`${peer.nick} ${reason === "cancelled" ? "cancelled — stopped (others continue)" : "left"}.`);
+  if (![...S.peers.values()].some((p) => !p.done && !p.left)) {
+    S.started = false;
+    releaseScreen();
+  }
+}
+
+async function startTransfer(forceRelay, onlyNew) {
   if (!S.file) { setStatus($("senderStatus"), "Pick a file first.", "err"); return; }
   if (!S.code) { setStatus($("senderStatus"), "Click “Get QR & code” first.", "err"); return; }
+  let targets = [...S.peers.values()].filter((p) => !p.done && !p.left);
+  if (onlyNew) targets = targets.filter((p) => p.sentChunks === 0 && !p.pumping);
+  if (!targets.length) {
+    if ([...S.peers.values()].some((p) => !p.left)) { setStatus($("senderStatus"), "Everyone already has the file.", "ok"); return; }
+    setStatus($("senderStatus"), "No receiver connected yet — share the code first.", "err");
+    return;
+  }
   S.cancelled = false;
-  S.useRelay = forceRelay;
   S.started = true;
   S.startTime = Date.now();
-  S.chunkSize = CHUNK_SIZE;
   lockScreen();
-  S.totalChunks = Math.max(1, Math.ceil(S.file.size / CHUNK_SIZE));
   $("sendProgressWrap").hidden = false;
   $("btnRetrySend").hidden = true;
   $("sendLabel").textContent = forceRelay ? "Relaying via server…" : "Sending…";
-
-  if (forceRelay) {
-    setStatus($("senderStatus"), "Relaying through server (fallback)…", "");
-    relaySend();
-    return;
-  }
-
-  // P2P path
-  const pc = makeSenderPC();
-  setStatus($("senderStatus"), "Connecting directly to receiver…");
-  $("btnRelay").hidden = true;
-  clearTimeout(S.p2pTimer);
-  S.p2pTimer = setTimeout(() => {
-    if (S.started && !S.useRelay && S.sentChunks === 0 && pc.connectionState !== "connected") {
-      setStatus($("senderStatus"), "Still connecting — devices may be on incompatible networks. You can use relay.", "err");
-      $("btnRelay").hidden = false;
-      log("P2P is taking >12s: likely symmetric NAT. Relay fallback available.");
-    }
-  }, P2P_TIMEOUT_MS);
-
-  try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendSignal({ type: "signal", code: S.code, payload: { kind: "offer", sdp: pc.localDescription } });
-    log("Offer sent, waiting for receiver's answer…");
-  } catch (err) {
-    setStatus($("senderStatus"), "Could not start WebRTC: " + err.message, "err");
+  setStatus($("senderStatus"), `${forceRelay ? "Relaying" : "Sending"} to ${targets.length} receiver(s)…`);
+  for (const peer of targets) {
+    if (peer.pumping) continue;
+    peer.sentChunks = 0;
+    peer.done = false;
+    peer.startTime = Date.now();
+    if (forceRelay || peer.useRelay) startRelayPeer(peer);
+    else ensurePeerConnection(peer);
   }
 }
 
-async function pumpP2P() {
-  const { file, fileId, dc } = S;
-  if (!file || !dc || dc.readyState !== "open") return;
+async function pumpPeerP2P(peer) {
+  const file = S.file;
+  if (!file || !peer.dc || peer.dc.readyState !== "open") return;
+  if (peer.pumping) return; // one pump per receiver — others run in parallel
+  peer.pumping = true;
+  peer.state = "sending";
+  peer.totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+  const fileId = S.fileId;
   // Ask receiver where to resume (it replies with {kind:'resume'} if partial).
-  dc.send(JSON.stringify({
+  peer.dc.send(JSON.stringify({
     kind: "meta", fileId, name: file.name, size: file.size,
     mime: file.type || "application/octet-stream",
-    totalChunks: S.totalChunks, chunkSize: CHUNK_SIZE,
+    totalChunks: peer.totalChunks, chunkSize: CHUNK_SIZE, nick: myNick(),
   }));
   await sleep(250); // let receiver reply with resume offset before we blast chunks
-  if (S.cancelled) return;
+  if (S.cancelled || peer.left || peer.done) { peer.pumping = false; return; }
 
-  for (let i = S.sentChunks; i < S.totalChunks; i++) {
-    if (S.cancelled) return;
-    if (dc.readyState !== "open") { S.sentChunks = i; return; } // onclose handler offers retry
-    while (dc.bufferedAmount > MAX_BUFFERED) await sleep(100);
+  for (let i = peer.sentChunks; i < peer.totalChunks; i++) {
+    if (S.cancelled || peer.left) { peer.pumping = false; return; }
+    if (peer.dc.readyState !== "open") { peer.sentChunks = i; peer.pumping = false; return; } // onclose handler offers retry
+    while (peer.dc.bufferedAmount > MAX_BUFFERED) await sleep(100);
+    if (S.cancelled || peer.left) { peer.pumping = false; return; }
     const slice = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
     const buf = await slice.arrayBuffer();
-    dc.send(buf);
-    S.sentChunks = i + 1;
-    if (i % 10 === 0 || i === S.totalChunks - 1) updateSendProgress();
+    try { peer.dc.send(buf); }
+    catch { peer.sentChunks = i; peer.pumping = false; return; }
+    peer.sentChunks = i + 1;
+    if (i % 10 === 0 || i === peer.totalChunks - 1) { updatePeerRow(peer); updateSendProgress(); }
   }
-  dc.send(JSON.stringify({ kind: "done", fileId }));
-  updateSendProgress();
-  setStatus($("senderStatus"), `Sent ${file.name} (${fmtBytes(file.size)}) directly.`, "ok");
-  log(`P2P transfer complete: ${S.totalChunks} chunks.`);
+  try { peer.dc.send(JSON.stringify({ kind: "done", fileId })); } catch {}
+  peer.pumping = false;
+  peer.done = true;
+  peer.state = "done";
+  updatePeerRow(peer); updateSendProgress(); renderPeerList();
+  addHistory("sent", file.name, file.size, null, peer.nick);
+  log(`Sent ${file.name} to ${peer.nick} directly (${peer.totalChunks} chunks).`);
+  notifyDone(`${file.name} → ${peer.nick}`);
+  finishSenderIfAllDone();
+}
+
+function finishSenderIfAllDone() {
+  if ([...S.peers.values()].some((p) => !p.done && !p.left)) return;
   S.started = false;
-  clearTimeout(S.p2pTimer);
-  notifyDone(file.name);
   releaseScreen();
+  setStatus($("senderStatus"), "All receivers got the file.", "ok");
 }
 
 function updateSendProgress() {
-  const done = S.sentChunks, total = S.totalChunks || 1;
-  const pct = Math.round((done / total) * 100);
+  const peers = [...S.peers.values()].filter((p) => !p.left);
+  const avg = peers.length ? peers.reduce((s, p) => s + peerFrac(p), 0) / peers.length : 0;
+  const pct = Math.round(avg * 100);
   $("sendBar").style.width = pct + "%";
   $("sendPct").textContent = pct + "%";
   const elapsed = Math.max(0.1, (Date.now() - S.startTime) / 1000);
-  const bytes = Math.min(S.file ? S.file.size : 0, done * (S.chunkSize || CHUNK_SIZE));
-  $("sendStats").textContent = `${fmtBytes(bytes)} of ${fmtBytes(S.file.size)} · ${fmtSpeed(bytes / elapsed)} · ETA ${fmtETA(elapsed, done, total)} · chunk ${done}/${total}`;
+  const doneBytes = peers.reduce((s, p) => s + Math.min(p.sentChunks * (p.useRelay ? RELAY_CHUNK_SIZE : CHUNK_SIZE), S.file ? S.file.size : 0), 0);
+  const totalBytes = (S.file ? S.file.size : 0) * Math.max(1, peers.length);
+  const who = peers.length > 1 ? `${peers.length} receivers` : (peers[0] ? peers[0].nick : "");
+  $("sendStats").textContent = `${fmtBytes(doneBytes)} of ${fmtBytes(totalBytes)} · ${fmtSpeed(doneBytes / elapsed)} · ETA ${fmtETA(elapsed, avg * 100, 100)} · ${who}`;
+  for (const p of peers) updatePeerRow(p);
 }
 
 // ---------- sender: relay fallback (server-forwarded chunks) ----------
@@ -434,42 +635,49 @@ function bufToBase64(buf) {
   return btoa(s);
 }
 
-async function relaySend() {
-  const { file, fileId, code } = S;
+function startRelayPeer(peer) {
+  peer.useRelay = true;
+  peer.state = "relaying";
+  closePeer(peer, false);
+  updatePeerRow(peer); renderPeerList();
+  relaySendPeer(peer);
+}
+
+async function relaySendPeer(peer) {
+  const file = S.file, code = S.code;
+  if (!file || !code || peer.left) return;
+  if (peer.pumping) return;
+  peer.pumping = true;
+  const rid = S.fileId + "#relay"; // separate ID so P2P-partial chunks never mix with relay chunks
   const total = Math.max(1, Math.ceil(file.size / RELAY_CHUNK_SIZE));
-  S.totalChunks = total;
-  S.chunkSize = RELAY_CHUNK_SIZE;
-  sendSignal({ type: "relay", code, payload: {
-    kind: "relay-meta", fileId, name: file.name, size: file.size,
-    mime: file.type || "application/octet-stream", totalChunks: total,
+  peer.totalChunks = total;
+  peer.sentChunks = 0; // relay-ack below fast-forwards to receiver's offset if it has any
+  peer.startTime = Date.now();
+  sendSignal({ type: "relay", code, target: peer.id, payload: {
+    kind: "relay-meta", fileId: rid, name: file.name, size: file.size,
+    mime: file.type || "application/octet-stream", totalChunks: total, nick: myNick(),
   }});
   // If receiver already has part of this file it will answer relay-ack; give it a beat.
   await sleep(400);
-  for (let i = S.sentChunks; i < total; i++) {
-    if (S.cancelled) return;
+  for (let i = peer.sentChunks; i < total; i++) {
+    if (S.cancelled || peer.left) { peer.pumping = false; return; }
     const slice = file.slice(i * RELAY_CHUNK_SIZE, (i + 1) * RELAY_CHUNK_SIZE);
     const buf = await slice.arrayBuffer();
-    sendSignal({ type: "relay", code, payload: {
-      kind: "relay-chunk", fileId, index: i, base64: bufToBase64(buf), isLast: i === total - 1,
+    sendSignal({ type: "relay", code, target: peer.id, payload: {
+      kind: "relay-chunk", fileId: rid, index: i, base64: bufToBase64(buf), isLast: i === total - 1,
     }});
-    S.sentChunks = i + 1;
-    if (i % 5 === 0 || i === total - 1) updateSendProgress();
+    peer.sentChunks = i + 1;
+    if (i % 5 === 0 || i === total - 1) { updatePeerRow(peer); updateSendProgress(); }
     await sleep(10); // avoid flooding the socket
   }
-  updateSendProgress();
-  setStatus($("senderStatus"), `Relayed ${file.name} via server.`, "ok");
-  log("Relay transfer complete.");
-  S.started = false;
-  notifyDone(file.name);
-  releaseScreen();
-}
-
-function closeSenderPeer(logIt) {
-  clearTimeout(S.p2pTimer);
-  try { S.dc && S.dc.close(); } catch {}
-  try { S.pc && S.pc.close(); } catch {}
-  S.pc = null; S.dc = null;
-  if (logIt) log("Sender peer connection closed.");
+  peer.pumping = false;
+  peer.done = true;
+  peer.state = "done";
+  updatePeerRow(peer); updateSendProgress(); renderPeerList();
+  addHistory("sent", file.name, file.size, null, peer.nick);
+  log(`Relayed ${file.name} to ${peer.nick}.`);
+  notifyDone(`${file.name} → ${peer.nick}`);
+  finishSenderIfAllDone();
 }
 
 // ================= RECEIVER UI =================
@@ -480,7 +688,7 @@ $("btnJoin").onclick = async () => {
   resetReceiverFile();
   try {
     await ensureSocket();
-    sendSignal({ type: "join", code });
+    sendSignal({ type: "join", code, nick: myNick() });
     setStatus($("receiverStatus"), `Joining ${code}…`);
   } catch (err) {
     setStatus($("receiverStatus"), err.message, "err");
@@ -494,6 +702,16 @@ $("btnLeave").onclick = async () => {
   $("btnLeave").hidden = true;
 };
 
+// Receiver Cancel: stop the incoming transfer and tell the sender to stop too.
+$("btnCancelRecv").onclick = async () => {
+  try { R.dc && R.dc.readyState === "open" && R.dc.send(JSON.stringify({ kind: "cancel-request" })); } catch {}
+  if (R.code) { try { await sendSignal({ type: "relay", code: R.code, payload: { kind: "cancel-request", fileId: R.fileId } }); } catch {} }
+  closeReceiverPeer(false);
+  resetReceiverFile();
+  setStatus($("receiverStatus"), "Cancelled — cleared.", "err");
+  log("Receive cancelled and cleared.");
+};
+
 function resetReceiverFile() {
   R.meta = null; R.chunks = []; R.received = 0; R.totalChunks = 0;
   R.done = false; R.relayMode = false; R.fileId = null;
@@ -501,6 +719,9 @@ function resetReceiverFile() {
   $("recvProgressWrap").hidden = true;
   $("downloadLink").hidden = true;
   $("recvBar").style.width = "0%";
+  $("recvStats").textContent = "";
+  $("recvLabel").textContent = "Receiving…";
+  releaseScreen();
 }
 
 function makeReceiverPC() {
@@ -514,7 +735,7 @@ function makeReceiverPC() {
   pc.onconnectionstatechange = () => {
     log(`Receiver connection: ${pc.connectionState}`);
     if (pc.connectionState === "connected") setStatus($("receiverStatus"), "Connected directly (P2P). Receiving…", "ok");
-    if (pc.connectionState === "failed") setStatus($("receiverStatus"), "Direct connection failed. Ask the sender to press “Use relay instead”.", "err");
+    if (pc.connectionState === "failed") setStatus($("receiverStatus"), "Direct path failed — sender auto-switches to relay. Keep this tab open.", "err");
   };
   pc.ondatachannel = (e) => {
     const dc = e.channel;
@@ -542,8 +763,10 @@ function onP2PMessage(dc) {
         if (!sameFile) { R.meta = m; R.totalChunks = m.totalChunks; R.chunks = new Array(m.totalChunks); R.received = 0; R.startTime = Date.now(); }
         R.done = false;
         $("recvProgressWrap").hidden = false;
+        $("btnCancelRecv").hidden = false;
+        if (m.nick) R.senderNick = m.nick;
         $("recvLabel").textContent = `Receiving ${m.name}…`;
-        setStatus($("receiverStatus"), `Receiving ${m.name} (${fmtBytes(m.size)}) directly…`, "ok");
+        setStatus($("receiverStatus"), `Receiving ${m.name} (${fmtBytes(m.size)}) from ${R.senderNick || "sender"}…`, "ok");
         lockScreen();
         log(`Receiving ${m.name} — ${m.totalChunks} chunks${R.received ? ` (resuming at ${R.received})` : ""}.`);
         // Tell sender where to start (resume support).
@@ -554,7 +777,8 @@ function onP2PMessage(dc) {
       } else if (m.kind === "done") {
         finishReceive();
       } else if (m.kind === "cancel") {
-        setStatus($("receiverStatus"), "Sender cancelled the transfer.", "err");
+        resetReceiverFile();
+        setStatus($("receiverStatus"), "Sender cancelled — cleared.", "err");
       }
       return;
     }
@@ -592,8 +816,10 @@ function finishReceive() {
   a.download = (R.meta && R.meta.name) || "download";
   a.hidden = false;
   a.textContent = `Download ${(R.meta && R.meta.name) || "file"} (${fmtBytes(blob.size)})`;
+  $("btnCancelRecv").hidden = true;
   updateRecvProgress();
-  setStatus($("receiverStatus"), `Received ${R.meta.name} (${fmtBytes(blob.size)}). Tap Download to save it.`, "ok");
+  addHistory("received", R.meta.name, blob.size, url, R.senderNick);
+  setStatus($("receiverStatus"), `Received ${R.meta.name} (${fmtBytes(blob.size)}) from ${R.senderNick || "sender"}. Tap Download to save it.`, "ok");
   log(`Transfer complete: ${R.meta.name}.`);
   notifyDone(R.meta.name);
   releaseScreen();
@@ -616,7 +842,7 @@ function base64ToBuf(b64) {
   return b.buffer;
 }
 
-async function onRelayPayload(p) {
+async function onRelayPayload(p, from) {
   if (p.kind === "relay-meta") {
     const sameFile = R.fileId === p.fileId && R.meta;
     R.fileId = p.fileId;
@@ -625,8 +851,10 @@ async function onRelayPayload(p) {
     p.chunkSize = RELAY_CHUNK_SIZE; // correct progress math for 32 KB relay chunks
     R.done = false;
     $("recvProgressWrap").hidden = false;
+    $("btnCancelRecv").hidden = false;
+    if (p.nick) R.senderNick = p.nick;
     $("recvLabel").textContent = `Receiving ${p.name} (relay)…`;
-    setStatus($("receiverStatus"), `Receiving ${p.name} via server relay…`, "ok");
+    setStatus($("receiverStatus"), `Receiving ${p.name} from ${R.senderNick || "sender"} via relay…`, "ok");
     log(`Relay receive: ${p.name}, ${p.totalChunks} chunks.`);
     lockScreen();
     // Tell sender our offset so relay can resume.
@@ -643,16 +871,21 @@ async function onRelayPayload(p) {
     R.received = R.chunks.filter(Boolean).length;
     updateRecvProgress();
     if (p.isLast || R.received >= R.totalChunks) finishReceive();
-  } else if (p.kind === "relay-ack" && S.started && S.useRelay) {
-    // Sender side: receiver reports offset.
-    if (p.fileId === S.fileId && (p.received || 0) > S.sentChunks) {
-      S.sentChunks = p.received;
-      log(`Relay resuming from chunk ${p.received}.`);
+  } else if (p.kind === "cancel-request") {
+    const peer = S.peers.get(from);
+    if (peer) { stopPeer(peer, "cancelled"); setStatus($("senderStatus"), `${peer.nick} cancelled. Others continue.`, "err"); }
+  } else if (p.kind === "relay-ack" && S.started) {
+    // Sender side: that receiver reports its offset.
+    const peer = S.peers.get(from);
+    if (peer && peer.useRelay && S.fileId && p.fileId === S.fileId + "#relay" && (p.received || 0) > peer.sentChunks) {
+      peer.sentChunks = p.received;
+      log(`Relay to ${peer.nick} resuming from chunk ${p.received}.`);
     }
   } else if (p.kind === "relay-text") {
     addMessage(p.text || "", false);
   } else if (p.kind === "cancel") {
-    setStatus($("receiverStatus"), "Sender cancelled the transfer.", "err");
+    resetReceiverFile();
+    setStatus($("receiverStatus"), "Sender cancelled — cleared.", "err");
   }
 }
 
@@ -669,20 +902,25 @@ async function onSignalMessage(ev) {
   }
   if (m.type === "joined") {
     R.code = m.code;
-    setStatus($("receiverStatus"), `Joined ${m.code}. Waiting for sender…`, "ok");
+    R.peerId = m.peerId || null;
+    R.senderNick = m.senderNick || "Sender";
+    setStatus($("receiverStatus"), `Joined ${m.code}. Sender: ${R.senderNick}. Waiting for file…`, "ok");
     $("btnLeave").hidden = false;
     makeReceiverPC(); // ready before offer arrives; queued ICE handled below
-    log(`Joined room ${m.code}.`);
-    setStatus($("textStatus"), `Connected to ${m.code} — you can send text here.`, "ok");
+    log(`Joined room ${m.code} as ${myNick()} (${m.count}/${m.max} receivers). Sender: ${R.senderNick}.`);
+    setStatus($("textStatus"), `Connected to ${R.senderNick} — you can send text here.`, "ok");
     return;
   }
   if (m.type === "peer-joined") {
-    setStatus($("senderStatus"), "Receiver connected! Starting transfer…", "ok");
-    setStatus($("textStatus"), "Receiver connected — you can send text here.", "ok");
-    log("Receiver joined — auto-starting transfer.");
+    const peer = addPeer(m.peerId, m.nick);
+    log(`${peer.nick} joined (${m.count}/${m.max}) — auto-starting transfer.`);
+    setStatus($("senderStatus"), `${m.count} receiver(s) connected. Starting transfer…`, "ok");
+    setStatus($("textStatus"), `${peer.nick} connected — you can send text here.`, "ok");
     $("btnSendStart").disabled = false;
-    if (S.file && !S.started) startTransfer(false);
-    else if (S.file && S.started) { /* already sending */ }
+    $("btnRelay").hidden = true;
+    ensurePeerConnection(peer);
+    if (S.file && !S.started && !S.cancelled) startTransfer(false, true); // only the newcomer
+    // If already sending, the new data channel's onopen pumps this late joiner.
     return;
   }
   if (m.type === "signal") {
@@ -705,32 +943,53 @@ async function onSignalMessage(ev) {
         }
       } catch (err) { log("Receiver WebRTC error: " + err.message); }
     } else {
-      // Sender side: handle answer/ice from receiver.
-      if (!S.pc) return;
+      // Sender side: route answer/ice to the right receiver's PC.
+      const peer = S.peers.get(m.from);
+      if (!peer || !peer.pc) return;
       try {
         if (p.kind === "answer") {
-          await S.pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
-          for (const c of S.pendingIce) await S.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
-          S.pendingIce = [];
-          log("P2P handshake complete, establishing data channel…");
+          await peer.pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+          for (const c of peer.pendingIce) await peer.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+          peer.pendingIce = [];
+          log(`P2P handshake with ${peer.nick} complete.`);
         } else if (p.kind === "ice") {
-          if (S.pc.remoteDescription) await S.pc.addIceCandidate(new RTCIceCandidate(p.candidate)).catch(() => {});
-          else S.pendingIce.push(p.candidate);
+          if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(new RTCIceCandidate(p.candidate)).catch(() => {});
+          else peer.pendingIce.push(p.candidate);
         }
-      } catch (err) { log("Sender WebRTC error: " + err.message); }
+      } catch (err) { log(`Sender WebRTC error (${peer.nick}): ` + err.message); }
     }
     return;
   }
   if (m.type === "relay") {
-    onRelayPayload(m.payload || {});
+    if (m.target && m.target !== R.peerId) return; // addressed to another receiver
+    onRelayPayload(m.payload || {}, m.from);
+    return;
+  }
+  if (m.type === "nick") {
+    if (m.from === "sender") {
+      R.senderNick = m.nick || "Sender";
+      log(`Sender is now known as ${R.senderNick}.`);
+      if (R.code) setStatus($("receiverStatus"), `Connected to ${R.senderNick}.`, "ok");
+    } else if (m.from) {
+      const peer = S.peers.get(m.from);
+      if (peer) { peer.nick = m.nick || peer.nick; renderPeerList(); log(`${peer.nick} updated their name.`); }
+    }
     return;
   }
   if (m.type === "peer-left") {
-    log("The other device disconnected.");
-    setStatus($("textStatus"), "The other device left.", "err");
-    releaseScreen();
-    if (paneSend.hidden === false) setStatus($("senderStatus"), "The other device left. The code stays valid for a short while.", "err");
-    else setStatus($("receiverStatus"), "The other device left.", "err");
+    if (m.role === "sender") {
+      log("Sender left — transfer over.");
+      closeReceiverPeer();
+      setStatus($("receiverStatus"), "Sender left. Ask for a new code to try again.", "err");
+      setStatus($("textStatus"), "Sender left.", "err");
+    } else {
+      const peer = S.peers.get(m.peerId);
+      if (peer) stopPeer(peer, "left");
+      updatePeerCount();
+      const left = [...S.peers.values()].filter((p) => !p.left).length;
+      log(`A receiver left (${left} remaining).`);
+      if (S.code) setStatus($("senderStatus"), `${left} receiver(s) connected.`, left ? "" : "err");
+    }
     return;
   }
   if (m.type === "expired") {
@@ -858,10 +1117,13 @@ $("qrFile").addEventListener("change", async () => {
 
 // ---------- instant text share (same connection, either direction) ----------
 function activeCode() { return S.code || R.code; }
-function p2pOpen() {
-  if (S.dc && S.dc.readyState === "open") return S.dc;
-  if (R.dc && R.dc.readyState === "open") return R.dc;
-  return null;
+function openDCs() {
+  const out = [];
+  for (const peer of S.peers.values()) {
+    if (!peer.left && !peer.done && peer.dc && peer.dc.readyState === "open") out.push(peer.dc);
+  }
+  if (R.dc && R.dc.readyState === "open") out.push(R.dc);
+  return out;
 }
 function addMessage(text, mine) {
   if (!text) return;
@@ -887,8 +1149,8 @@ $("btnTextSend").onclick = async () => {
   if (!text) { setStatus($("textStatus"), "Type something first.", "err"); return; }
   if (text.length > 20000) { setStatus($("textStatus"), "Text too long (20,000 chars max).", "err"); return; }
   try {
-    const dc = p2pOpen();
-    if (dc) dc.send(JSON.stringify({ kind: "text", text }));
+    const dcs = openDCs();
+    if (dcs.length) dcs.forEach((dc) => { try { dc.send(JSON.stringify({ kind: "text", text })); } catch {} });
     else if (activeCode()) await sendSignal({ type: "relay", code: activeCode(), payload: { kind: "relay-text", text } });
     else { setStatus($("textStatus"), "Connect first: sender — Get QR & code; receiver — enter code.", "err"); return; }
     addMessage(text, true);

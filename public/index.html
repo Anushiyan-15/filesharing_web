@@ -15,6 +15,14 @@
 <main class="wrap">
   <div id="compatWarn" class="warn" hidden></div>
 
+  <div class="card profile-card">
+    <label for="nickInput"><strong>Your nickname</strong> <span class="muted small">(other device sees this — editable anytime)</span></label>
+    <div class="row nick-row">
+      <input id="nickInput" class="nick-input" maxlength="24" placeholder="e.g. Ravi's Phone" autocomplete="nickname" />
+      <span id="nickSaved" class="muted small"></span>
+    </div>
+  </div>
+
   <nav class="tabs" role="tablist">
     <button id="tabSend" class="tab active" role="tab">Send</button>
     <button id="tabReceive" class="tab" role="tab">Receive</button>
@@ -59,6 +67,8 @@
           <div class="muted small">Or enter this code on the other device</div>
           <div id="shareCode" class="code">––––––</div>
           <div id="codeExpiry" class="muted small"></div>
+          <div id="peerCount" class="muted small">No receivers yet (max 5).</div>
+          <div id="peerList" class="peer-list"></div>
           <div class="row">
             <button id="btnCopyCode" class="btn ghost">Copy code</button>
             <button id="btnCopyLink" class="btn ghost">Copy link</button>
@@ -106,7 +116,10 @@
       <div class="progress-top"><span id="recvLabel">Receiving…</span><span id="recvPct">0%</span></div>
       <div class="progress"><div id="recvBar" class="bar"></div></div>
       <div id="recvStats" class="muted small"></div>
-      <a id="downloadLink" class="btn primary" hidden>Download file</a>
+      <div class="row">
+        <a id="downloadLink" class="btn primary" hidden>Download file</a>
+        <button id="btnCancelRecv" class="btn ghost">Cancel</button>
+      </div>
     </div>
   </section>
 
@@ -122,6 +135,11 @@
       <button id="btnTextSend" class="btn primary">Send text</button>
     </div>
     <div id="msgList" class="msg-list" hidden></div>
+  </section>
+
+  <section class="card">
+    <h3>History (this device, this session)</h3>
+    <ul id="historyList" class="log"></ul>
   </section>
 
   <section class="card log-card">
