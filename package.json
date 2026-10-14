@@ -1,0 +1,18 @@
+{
+  "name": "p2p-share",
+  "version": "1.0.0",
+  "description": "Peer-to-peer file sharing with QR + short code (WebRTC data channels, WebSocket signaling + relay fallback)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

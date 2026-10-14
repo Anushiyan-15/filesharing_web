@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>P2P Share — Send files directly</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span> P2P Share</div>
+  <div class="hint">No sign-up · Direct transfer · Nothing stored on server</div>
+</header>
+
+<main class="wrap">
+  <div id="compatWarn" class="warn" hidden></div>
+
+  <nav class="tabs" role="tablist">
+    <button id="tabSend" class="tab active" role="tab">Send</button>
+    <button id="tabReceive" class="tab" role="tab">Receive</button>
+  </nav>
+
+  <!-- ============ SENDER ============ -->
+  <section id="paneSend" class="card">
+    <h2>Send a file</h2>
+    <p class="muted">Pick a file → share the QR code or 6-digit code → keep this tab open until transfer finishes.</p>
+
+    <div id="dropZone" class="drop" tabindex="0">
+      <div class="drop-inner">
+        <div class="drop-icon">⇪</div>
+        <div><strong>Drag &amp; drop a file here</strong> or <span class="link">browse</span></div>
+        <div class="muted small">Files are read in 16 KB chunks — multi-GB files work, they just take longer.</div>
+      </div>
+      <input id="fileInput" type="file" hidden />
+    </div>
+
+    <div id="fileRow" class="file-row" hidden>
+      <div class="file-meta">
+        <div id="fileName" class="file-name"></div>
+        <div id="fileSize" class="muted small"></div>
+      </div>
+      <button id="changeFile" class="btn ghost">Change</button>
+    </div>
+
+    <div class="row">
+      <button id="btnCreate" class="btn primary" disabled>Get QR &amp; code</button>
+      <button id="btnSendStart" class="btn" disabled>Start transfer</button>
+      <button id="btnRelay" class="btn ghost" hidden>Use relay instead</button>
+    </div>
+
+    <div id="shareBox" class="share" hidden>
+      <div class="share-grid">
+        <div class="qr-wrap">
+          <div id="qr"></div>
+          <div class="muted small">Scan with the receiving device</div>
+        </div>
+        <div class="code-wrap">
+          <div class="muted small">Or enter this code on the other device</div>
+          <div id="shareCode" class="code">––––––</div>
+          <div class="row">
+            <button id="btnCopyCode" class="btn ghost">Copy code</button>
+            <button id="btnCopyLink" class="btn ghost">Copy link</button>
+          </div>
+          <div id="senderStatus" class="status">Waiting for receiver…</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="sendProgressWrap" class="progress-wrap" hidden>
+      <div class="progress-top"><span id="sendLabel">Sending…</span><span id="sendPct">0%</span></div>
+      <div class="progress"><div id="sendBar" class="bar"></div></div>
+      <div id="sendStats" class="muted small"></div>
+      <div class="row">
+        <button id="btnCancelSend" class="btn ghost">Cancel</button>
+        <button id="btnRetrySend" class="btn" hidden>Retry</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RECEIVER ============ -->
+  <section id="paneReceive" class="card" hidden>
+    <h2>Receive a file</h2>
+    <p class="muted">Enter the 6-digit code from the sending device, or open the scanned QR link.</p>
+    <div class="row">
+      <input id="codeInput" class="code-input" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" />
+      <button id="btnJoin" class="btn primary">Connect</button>
+      <button id="btnLeave" class="btn ghost" hidden>Disconnect</button>
+    </div>
+    <div id="receiverStatus" class="status">Not connected.</div>
+
+    <div id="recvProgressWrap" class="progress-wrap" hidden>
+      <div class="progress-top"><span id="recvLabel">Receiving…</span><span id="recvPct">0%</span></div>
+      <div class="progress"><div id="recvBar" class="bar"></div></div>
+      <div id="recvStats" class="muted small"></div>
+      <a id="downloadLink" class="btn primary" hidden>Download file</a>
+    </div>
+  </section>
+
+  <section class="card log-card">
+    <h3>Connection log</h3>
+    <ul id="log" class="log"></ul>
+  </section>
+
+  <section class="card muted small">
+    <strong>How it works:</strong> both devices join the same 6-digit room via WebSocket.
+    The sender's browser then connects <em>directly</em> to the receiver with WebRTC
+    (STUN-assisted). File bytes travel peer-to-peer in 16 KB chunks and never touch
+    disk on any server. If both devices are behind strict NATs where direct UDP fails,
+    the app falls back to relaying chunks through the signaling server — slower, but it works.
+    For guaranteed direct transfers across any network in production, add a TURN server
+    (see README).
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
