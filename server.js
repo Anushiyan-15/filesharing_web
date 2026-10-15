@@ -2,13 +2,14 @@
  * P2P Share — signaling server (1 sender → up to 5 receivers)
  *
  * Stack choice: Node.js + Express (static hosting) + ws (WebSocket signaling).
- * Why: WebRTC needs only a tiny signaling channel (SDP/ICE exchange).
- * No DB, no accounts, no file storage — file bytes go peer-to-peer via
- * RTCDataChannel whenever possible (sender opens one PeerConnection per
- * receiver, each throttled independently so a slow receiver never blocks
- * a fast one). The server only relays signaling JSON and, as a last resort,
- * chunked file bytes when direct P2P is impossible. The frontend is
- * dependency-free vanilla HTML/CSS/JS so there is no build step.
+ * WebRTC needs only a tiny signaling channel (SDP/ICE exchange). No DB, no
+ * accounts, no file storage — file bytes go peer-to-peer via RTCDataChannel
+ * whenever possible. The server only relays signaling JSON and, as a last
+ * resort, chunked file bytes when direct P2P is impossible.
+ *
+ * TURN credentials are NEVER hardcoded here for the frontend: browsers fetch
+ * short-lived (or env-configured) credentials from GET /api/ice. The shared
+ * secret itself is never sent to any client and never logged.
  */
 
 const path = require("path");
@@ -23,12 +24,99 @@ const CODE_TTL_MS = 10 * 60 * 1000;
 // One sender can serve this many receivers at once on the same code.
 const MAX_RECEIVERS = 5;
 
+// ---- Hardening limits (see docs/TURN-SPEED.md §8) ----
+const MAX_WS_MSG = 1 * 1024 * 1024;      // max inbound WebSocket message (bytes)
+const MAX_RELAY_B64 = 700 * 1024;        // max relay-chunk base64 payload (~512 KB)
+const MAX_META_NAME = 255;               // max file name length
+const MAX_FILE_SIZE = 8 * 1024 * 1024 * 1024; // max advertised file size (8 GiB)
+const MAX_TOTAL_CHUNKS = 1000000;        // max chunks per transfer
+const MAX_MIME_LEN = 128;
+const DEST_QUEUE_CAP = 16 * 1024 * 1024; // per-destination queued bytes before pressure/drop
+const MAX_MSG_PER_SEC = 5000;            // per-socket inbound rate cap
+
+// ---- TURN configuration (all from environment; never logged) ----
+const TURN_URLS_RAW = (process.env.TURN_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
+const TURN_USER = process.env.TURN_USER || "";
+const TURN_PASS = process.env.TURN_PASS || "";
+const TURN_SECRET = process.env.TURN_SECRET || ""; // coturn static-auth-secret (REST)
+const TURN_REALM = process.env.TURN_REALM || "p2p-share";
+const TURN_TTL = Math.min(86400, Math.max(60, parseInt(process.env.TURN_TTL || "3600", 10) || 3600));
+
+const STUN_SERVERS = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:3478"];
+
+function validTurnUrl(u) {
+  return /^(turn|turns):[^\s/]+$/i.test(u);
+}
+
+// Deterministic UDP-first ordering: ?transport=udp, then bare turn:, then
+// ?transport=tcp, then turns:. Lets ICE try UDP relay before TCP/TLS.
+function orderTurnUrls(urls) {
+  const rank = (u) => {
+    const l = u.toLowerCase();
+    if (l.startsWith("turns:")) return 3;
+    if (l.includes("transport=tcp")) return 2;
+    if (l.includes("transport=udp")) return 0;
+    return 1;
+  };
+  return [...urls].sort((a, b) => rank(a) - rank(b));
+}
+
+// Build the TURN entry for /api/ice, or null when unconfigured.
+// REST mode (TURN_SECRET, coturn use-auth-secret): time-limited credentials
+//   username "<expiry>:<random>", password base64(HMAC-SHA1(secret, username)).
+// Static mode (TURN_USER + TURN_PASS): managed providers without REST support.
+function buildTurnEntry() {
+  const urls = orderTurnUrls(TURN_URLS_RAW.filter(validTurnUrl));
+  if (!urls.length) return { entry: null, error: TURN_URLS_RAW.length ? "no valid TURN URLs" : "TURN_URLS not set" };
+  if (TURN_SECRET) {
+    const expiry = Math.floor(Date.now() / 1000) + TURN_TTL;
+    const username = `${expiry}:${crypto.randomBytes(8).toString("hex")}`;
+    const password = crypto.createHmac("sha1", TURN_SECRET).update(username).digest("base64");
+    return { entry: { urls, username, credential: password }, ttl: TURN_TTL };
+  }
+  if (TURN_USER && TURN_PASS) {
+    return { entry: { urls, username: TURN_USER, credential: TURN_PASS }, ttl: 0 };
+  }
+  return { entry: null, error: "TURN URLs set but no TURN_SECRET or TURN_USER+TURN_PASS" };
+}
+
+function turnHosts() {
+  const out = [];
+  for (const u of orderTurnUrls(TURN_URLS_RAW.filter(validTurnUrl))) {
+    const noQuery = u.split("?")[0];
+    const afterScheme = noQuery.split(":").slice(1).join(":");
+    const host = afterScheme.startsWith("[")
+      ? afterScheme.slice(0, afterScheme.indexOf("]") + 1) // IPv6 literal
+      : afterScheme.split(":")[0].split("/")[0];
+    if (host && !out.includes(host)) out.push(host);
+  }
+  return out;
+}
+
 const app = express();
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/health", (_req, res) => res.json({ ok: true, maxReceivers: MAX_RECEIVERS }));
 
+// Short-lived ICE configuration. Cache explicitly disabled: credentials expire.
+app.get("/api/ice", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  const iceServers = [{ urls: [...STUN_SERVERS] }];
+  const { entry, error } = buildTurnEntry();
+  if (entry) iceServers.push(entry);
+  res.json({ iceServers, turn: !!entry, ttl: entry ? (TURN_SECRET ? TURN_TTL : 0) : 0, error: entry ? undefined : error });
+});
+
+// Configuration presence check. Reports hostnames only — never credentials.
+// NOTE: "configured" means the env is present and valid, NOT that the TURN
+// host is reachable. Test reachability separately (see docs/TURN-SPEED.md).
+app.get("/api/turn-check", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  const { entry, error } = buildTurnEntry();
+  res.json({ configured: !!entry, valid: !!entry, hosts: turnHosts(), error: entry ? undefined : error });
+});
+
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: MAX_WS_MSG });
 
 // code -> { sender: {ws, nick}, receivers: Map(peerId -> {ws, nick}), createdAt, timer }
 const rooms = new Map();
@@ -66,10 +154,63 @@ function destroyRoom(code) {
   rooms.delete(code);
 }
 
+// ---- Payload validation (invalid frames are dropped, never crash us) ----
+const SIGNAL_KINDS = new Set(["offer", "answer", "ice", "hello"]);
+const RELAY_KINDS = new Set(["relay-meta", "relay-chunk", "relay-ack", "relay-text", "cancel", "cancel-request", "probe-report"]);
+
+function validSignalPayload(p) {
+  if (!p || typeof p !== "object") return false;
+  if (!SIGNAL_KINDS.has(p.kind)) return false;
+  if (p.conn !== undefined && (!Number.isInteger(p.conn) || p.conn < 0 || p.conn > 15)) return false;
+  return true;
+}
+
+function validRelayPayload(p) {
+  if (!p || typeof p !== "object") return false;
+  if (!RELAY_KINDS.has(p.kind)) return false;
+  if (p.kind === "relay-meta") {
+    if (typeof p.name !== "string" || !p.name.length || p.name.length > MAX_META_NAME) return false;
+    if (!Number.isFinite(p.size) || p.size < 0 || p.size > MAX_FILE_SIZE) return false;
+    if (!Number.isInteger(p.totalChunks) || p.totalChunks < 1 || p.totalChunks > MAX_TOTAL_CHUNKS) return false;
+    if (p.mime !== undefined && (typeof p.mime !== "string" || p.mime.length > MAX_MIME_LEN)) return false;
+    if (p.fileId !== undefined && typeof p.fileId !== "string") return false;
+  }
+  if (p.kind === "relay-chunk") {
+    if (typeof p.fileId !== "string" || !p.fileId.length || p.fileId.length > 256) return false;
+    if (!Number.isInteger(p.index) || p.index < 0 || p.index >= MAX_TOTAL_CHUNKS) return false;
+    if (typeof p.base64 !== "string" || !p.base64.length || p.base64.length > MAX_RELAY_B64) return false;
+  }
+  if (p.kind === "relay-text" && (typeof p.text !== "string" || p.text.length > 20000)) return false;
+  return true;
+}
+
+// Forward one relay/signal frame with a bounded destination queue. If the
+// destination is more than DEST_QUEUE_CAP behind, the chunk is dropped and
+// the sender gets a {type:'pressure'} notice so v2 senders can requeue the
+// index (v1 senders ignore it; documented in README).
+function forwardChecked(destWs, senderWs, kind, code, from, target, payload) {
+  if (destWs.readyState !== 1) return false;
+  const isChunk = kind === "relay" && payload && payload.kind === "relay-chunk";
+  if (isChunk && destWs.bufferedAmount > DEST_QUEUE_CAP) {
+    send(senderWs, { type: "pressure", code, fileId: payload.fileId, index: payload.index });
+    return false;
+  }
+  send(destWs, { type: kind, code, from, target: target || null, payload });
+  return true;
+}
+
 wss.on("connection", (ws) => {
   ws.roomCode = null;
   ws.role = null;
   ws.peerId = null;
+  ws._msgTimes = [];
+
+  function rateOk() {
+    const now = Date.now();
+    ws._msgTimes = ws._msgTimes.filter((t) => now - t < 1000);
+    ws._msgTimes.push(now);
+    return ws._msgTimes.length <= MAX_MSG_PER_SEC;
+  }
 
   ws.on("message", (raw) => {
     let msg;
@@ -77,6 +218,11 @@ wss.on("connection", (ws) => {
       msg = JSON.parse(raw.toString());
     } catch {
       return send(ws, { type: "error", message: "Invalid JSON" });
+    }
+    if (!rateOk()) {
+      send(ws, { type: "error", message: "Rate limit exceeded" });
+      try { ws.close(1013, "rate limit"); } catch {}
+      return;
     }
 
     // ---- CREATE: sender asks for a fresh code ----
@@ -141,36 +287,36 @@ wss.on("connection", (ws) => {
     }
 
     // ---- SIGNAL / RELAY: route between sender and addressed receiver ----
-    // Sender -> receiver needs `target: peerId` (or single-receiver rooms
-    // work without it). Sender broadcast (no target, 2+ receivers) is
-    // allowed for relay only (cancel / text). Receiver -> sender is routed
-    // automatically with `from: peerId` attached.
+    // Top-level message types are unchanged (backward compatible). Parallel
+    // connections travel inside the payload as {conn: N} (default 0).
     if (msg.type === "signal" || msg.type === "relay") {
       const kind = msg.type;
       const code = String(msg.code || ws.roomCode || "");
       const room = rooms.get(code);
       if (!room) return send(ws, { type: "error", message: "Room not found. Recreate the code." });
-      const fwd = (dest, from) => send(dest, { type: kind, code, from, target: msg.target || null, payload: msg.payload });
+      const payload = msg.payload;
+      const okPayload = kind === "signal" ? validSignalPayload(payload) : validRelayPayload(payload);
+      if (!okPayload) return send(ws, { type: "error", message: "Invalid payload" });
 
       if (ws.role === "sender" && room.sender.ws === ws) {
         if (msg.target) {
           const rec = room.receivers.get(String(msg.target));
           if (!rec) return send(ws, { type: "error", message: "Receiver left or unknown." });
-          fwd(rec.ws, "sender");
+          forwardChecked(rec.ws, ws, kind, code, "sender", msg.target, payload);
           return;
         }
         if (room.receivers.size === 1) {
-          fwd([...room.receivers.values()][0].ws, "sender");
+          forwardChecked([...room.receivers.values()][0].ws, ws, kind, code, "sender", null, payload);
           return;
         }
         if (kind === "relay" && room.receivers.size > 1) {
-          for (const p of room.receivers.values()) fwd(p.ws, "sender"); // broadcast: cancel / text
+          for (const p of room.receivers.values()) forwardChecked(p.ws, ws, kind, code, "sender", null, payload);
           return;
         }
         return send(ws, { type: "waiting", message: "Waiting for a receiver to join…" });
       }
       if (ws.role === "receiver" && ws.peerId) {
-        fwd(room.sender.ws, ws.peerId);
+        forwardChecked(room.sender.ws, ws, kind, code, ws.peerId, null, payload);
         return;
       }
       return send(ws, { type: "error", message: "Not in this room. Join first." });
@@ -222,6 +368,12 @@ function leaveRoom(ws) {
   ws.role = null;
   ws.peerId = null;
 }
+
+// Startup config report (values redacted — never log secrets).
+(function reportConfig() {
+  const { entry, error } = buildTurnEntry();
+  console.log(`[config] TURN via /api/ice: ${entry ? `enabled (${turnHosts().join(", ") || "hosts?"}, ${TURN_SECRET ? `REST ttl=${TURN_TTL}s` : "static credentials"})` : `disabled (${error})`}`);
+})();
 
 server.listen(PORT, () => {
   console.log(`P2P Share running at http://localhost:${PORT}`);

@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+<div class="bg-orbs" aria-hidden="true"><i></i><i></i><i></i></div>
 <header class="topbar">
   <div class="brand"><span class="dot"></span> P2P Share</div>
   <div class="hint">No sign-up · Direct transfer · Nothing stored on server</div>
@@ -21,6 +22,36 @@
       <input id="nickInput" class="nick-input" maxlength="24" placeholder="e.g. Ravi's Phone" autocomplete="nickname" />
       <span id="nickSaved" class="muted small"></span>
     </div>
+  </div>
+
+  <div class="card">
+    <h3>Connection mode</h3>
+    <div class="row mode-row" role="radiogroup" aria-label="Connection mode">
+      <label><input type="radio" name="cmode" value="auto" /> Auto</label>
+      <label><input type="radio" name="cmode" value="direct" /> Same WiFi direct</label>
+      <label><input type="radio" name="cmode" value="turn" /> TURN relay</label>
+    </div>
+    <div class="muted small">Auto: pakkathula/direct mudinja direct, illana thanava relay. Same WiFi: relay-e use pannaathu (fast, local only). TURN: thoorama iruntha TURN server vazhiya send agum — rendu device-layum TURN select pannunga.</div>
+  </div>
+
+  <div class="card">
+    <h3>Appearance</h3>
+    <div class="row" style="align-items:center">
+      <label class="muted small" for="themeSel">Theme</label>
+      <select id="themeSel" class="theme-select" aria-label="Theme">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+        <option value="custom">Custom</option>
+      </select>
+      <label class="muted small" for="accentPick">Accent</label>
+      <input id="accentPick" class="color-input" type="color" value="#2563eb" aria-label="Accent color" />
+      <label class="muted small" for="bgPick">Background</label>
+      <input id="bgPick" class="color-input" type="color" value="#f6f7f9" aria-label="Background color" />
+      <label class="muted small" for="customDark"><input id="customDark" type="checkbox" /> Dark base</label>
+      <button id="btnThemeReset" class="btn ghost">Reset</button>
+    </div>
+    <div class="muted small">Accent/background apply to the Custom theme. System follows your OS setting.</div>
   </div>
 
   <nav class="tabs" role="tablist">
@@ -38,7 +69,7 @@
       <div class="drop-inner">
         <div class="drop-icon">⇪</div>
         <div><strong>Drag &amp; drop a file here</strong> or <span class="link">browse</span></div>
-        <div class="muted small">Files are read in 16 KB chunks — multi-GB files work, they just take longer.</div>
+        <div class="muted small">Files stream in striped 64 KiB frames over parallel connections — multi-GB files work, they just take longer.</div>
       </div>
       <input id="fileInput" type="file" hidden />
     </div>
@@ -73,7 +104,7 @@
             <button id="btnCopyCode" class="btn ghost">Copy code</button>
             <button id="btnCopyLink" class="btn ghost">Copy link</button>
           </div>
-          <div id="senderStatus" class="status">Waiting for receiver…</div>
+          <div id="senderStatus" class="status" aria-live="polite">Waiting for receiver…</div>
         </div>
       </div>
     </div>
@@ -81,7 +112,23 @@
     <div id="sendProgressWrap" class="progress-wrap" hidden>
       <div class="progress-top"><span id="sendLabel">Sending…</span><span id="sendPct">0%</span></div>
       <div class="progress"><div id="sendBar" class="bar"></div></div>
-      <div id="sendStats" class="muted small"></div>
+      <div id="sendStats" class="muted small" aria-live="polite"></div>
+      <canvas id="speedChart" class="chart" aria-hidden="true"></canvas>
+      <details id="sendDiag" class="diag">
+        <summary>Connection details</summary>
+        <div class="row" style="align-items:center">
+          <label class="muted small" for="connSel">Parallel connections</label>
+          <select id="connSel" class="theme-select" aria-label="Parallel connections">
+            <option value="auto">Auto (tuned)</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+          </select>
+          <button id="btnTune" class="btn ghost">Speed tune</button>
+        </div>
+        <div id="tuneResult" class="muted small"></div>
+        <div id="diagBody"></div>
+      </details>
       <div class="row">
         <button id="btnCancelSend" class="btn ghost">Cancel</button>
         <button id="btnRetrySend" class="btn" hidden>Retry</button>
@@ -94,7 +141,7 @@
     <h2>Receive a file</h2>
     <p class="muted">Enter the 6-digit code from the sending device, or open the scanned QR link.</p>
     <div class="row">
-      <input id="codeInput" class="code-input" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" />
+      <input id="codeInput" class="code-input" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" aria-label="6-digit connection code" />
       <button id="btnJoin" class="btn primary">Connect</button>
       <button id="btnLeave" class="btn ghost" hidden>Disconnect</button>
     </div>
@@ -110,12 +157,17 @@
       </div>
       <div class="muted small">Camera needs HTTPS (or localhost). Permission keta Allow kudunga; QR camera munnadi kaatunga.</div>
     </div>
-    <div id="receiverStatus" class="status">Not connected.</div>
+    <div id="receiverStatus" class="status" aria-live="polite">Not connected.</div>
 
     <div id="recvProgressWrap" class="progress-wrap" hidden>
       <div class="progress-top"><span id="recvLabel">Receiving…</span><span id="recvPct">0%</span></div>
       <div class="progress"><div id="recvBar" class="bar"></div></div>
-      <div id="recvStats" class="muted small"></div>
+      <div id="recvStats" class="muted small" aria-live="polite"></div>
+      <canvas id="recvChart" class="chart" aria-hidden="true"></canvas>
+      <details id="recvDiag" class="diag">
+        <summary>Connection details</summary>
+        <div id="recvDiagBody"></div>
+      </details>
       <div class="row">
         <a id="downloadLink" class="btn primary" hidden>Download file</a>
         <button id="btnCancelRecv" class="btn ghost">Cancel</button>
@@ -127,9 +179,9 @@
   <section id="paneText" class="card" hidden>
     <h2>Send text</h2>
     <p class="muted">Links, passwords, notes — instantly to the connected device. First connect via the Send / Receive tab.</p>
-    <div id="textStatus" class="status">Not connected.</div>
+    <div id="textStatus" class="status" aria-live="polite">Not connected.</div>
     <div class="row">
-      <textarea id="textInput" class="text-input" rows="3" maxlength="20000" placeholder="Type text or paste a link…"></textarea>
+      <textarea id="textInput" class="text-input" rows="3" maxlength="20000" placeholder="Type text or paste a link…" aria-label="Text to send"></textarea>
     </div>
     <div class="row">
       <button id="btnTextSend" class="btn primary">Send text</button>
@@ -149,12 +201,13 @@
 
   <section class="card muted small">
     <strong>How it works:</strong> both devices join the same 6-digit room via WebSocket.
-    The sender's browser then connects <em>directly</em> to the receiver with WebRTC
-    (STUN-assisted). File bytes travel peer-to-peer in 16 KB chunks and never touch
-    disk on any server. If both devices are behind strict NATs where direct UDP fails,
-    the app falls back to relaying chunks through the signaling server — slower, but it works.
-    For guaranteed direct transfers across any network in production, add a TURN server
-    (see README).
+    The sender's browser then connects <em>directly</em> to each receiver with WebRTC.
+    File bytes travel peer-to-peer in striped 64 KiB indexed frames over parallel
+    connections (legacy 16 KiB ordered mode for older peers) with per-chunk CRCs
+    and whole-file integrity verification — and never touch disk on any server.
+    If direct UDP fails, the app falls back to TURN relay and finally to relaying
+    chunks through the signaling server — slower, but it works. Speeds are shown
+    in decimal MB/s (1 MB = 1,000,000 bytes).
   </section>
 </main>
 

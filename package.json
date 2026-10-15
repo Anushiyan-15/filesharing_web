@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node --check server.js && node --check public/app.js && node test/framing.test.cjs && node test/config.test.cjs && node test/signaling.test.cjs && node test/relay-bench.cjs"
   },
   "dependencies": {
     "express": "^4.19.2",
